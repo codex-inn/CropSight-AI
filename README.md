@@ -16,6 +16,20 @@ Open the [CropSight tomato training notebook in Google Colab](https://colab.rese
 
 The notebook trains a YOLO model, evaluates it on the validation split, and downloads `cropsight-model-output.zip`. This is a training workflow, not an automatic deployment. The live GitHub Pages website still needs a deployed API endpoint to use the model. The included tomatOD dataset is CC BY-NC-SA 4.0; respect its non-commercial, attribution, and share-alike terms. Its ripeness labels are only a proxy for harvest readiness.
 
+## Browser-triggered GitHub Actions training (no terminal / no Colab notebook)
+
+A manual workflow is available at **Actions → Train CropSight tomato model → Run workflow**:
+https://github.com/codex-inn/CropSight-AI/actions/workflows/train-model.yml
+
+It requires a **direct HTTPS download URL** to the converted YOLO dataset ZIP. A normal web page, Google Drive preview page, or a file only on your computer will not work; the URL must return the ZIP file directly without an interactive sign-in. Enter an epoch count (start with 30), then run the workflow. It validates the ZIP and folder structure, trains YOLO on a GitHub-hosted CPU runner, evaluates the validation split, and stores the model as a workflow artifact for 14 days.
+
+**Important limitations**
+- GitHub-hosted standard runners generally use CPU, so training may be slow and can time out. This workflow does not provision a GPU.
+- The dataset archive must be accessible to the runner through a direct HTTPS link. Do not commit the 163 MB dataset ZIP to the repository.
+- A successful workflow only creates a downloadable model artifact; it does not deploy the FastAPI service or connect it to GitHub Pages.
+- The tomatOD dataset is CC BY-NC-SA 4.0. Follow attribution, share-alike and non-commercial terms. Ripeness labels are only a proxy for harvest readiness.
+- Never describe the model as reliable for harvest decisions until it has been tested on independent field images.
+
 ## Local development
 
 ```bash
