@@ -51,7 +51,19 @@ Copy api/dataset.yaml.example to a location of your choice (for example tomato-d
 
 **Important:** classes must be labeled from real examples and checked for consistency. The model does not know these categories just because the class names exist in YAML.
 
-## 4. Train a first model
+## 4. Validate the dataset before training
+
+After extracting the provided `CropSight_tomatOD_YOLO.zip`, locate its `dataset.yaml`. The extracted folder should contain `images`, `labels`, `dataset.yaml`, and `DATASET_NOTES.md`. From the repository root with the virtual environment active, run:
+
+~~~powershell
+python api/validate_dataset.py --data "C:\\CropSightData\\cropsight_tomatod_yolo\\dataset.yaml"
+~~~
+
+Replace that example path with the actual location of your extracted dataset. Continue only if the validator prints `PASSED`. It checks file presence, YOLO syntax, class IDs, and normalized coordinates; it cannot verify that the maturity labels are agronomically correct.
+
+The included dataset maps `fully-ripe` to `harvest_ready`, `semi-ripe` to `nearly_ready`, and `unripe` to `developing`. This is only an initial proxy mapping, not a guarantee of harvest readiness. The dataset is small; reserve the provided test split for final evaluation and avoid using it to tune training.
+
+## 5. Train a first model
 
 From the repository root with the virtual environment active:
 
@@ -63,7 +75,7 @@ The first run downloads the Ultralytics pretrained YOLO checkpoint if it is not 
 
 Training is only a starting point. Review precision/recall and mAP, inspect predictions, and evaluate on a held-out test set. If labels are scarce or imbalanced, results may be unreliable. Do not treat confidence as a calibrated probability or use it as an agronomic guarantee.
 
-## 5. Enable the trained model
+## 6. Enable the trained model
 
 After reviewing the training run, copy its best.pt checkpoint to the API's expected path:
 
@@ -74,7 +86,7 @@ Copy-Item "runs/cropsight/tomato-maturity/weights/best.pt" "api/models/tomato-ma
 
 If the actual training run folder differs, copy from the best.pt path printed by api/train.py. Restart the API and check /health; it should report model: configured. The first analysis request loads the checkpoint and verifies the required class labels. A generic detector with different labels is rejected.
 
-## 6. Connect the local website to the local API
+## 7. Connect the local website to the local API
 
 Create a file named .env.local in the repository root (do not commit it) containing:
 
