@@ -3,10 +3,6 @@ name: Train CropSight tomato model
 on:
   workflow_dispatch:
     inputs:
-      dataset_url:
-        description: "Direct HTTPS download URL for the converted YOLO dataset ZIP"
-        required: true
-        type: string
       epochs:
         description: "Training epochs (start with 30)"
         required: true
@@ -36,62 +32,68 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r api/requirements.txt
 
-      - name: Download dataset ZIP
-        env:
-          DATASET_URL: ${{ inputs.dataset_url }}
+      - name: Download public tomatOD dataset archive
         run: |
-          python - <<'PY'
-          import os
-          from urllib.request import Request, urlopen
-          from pathlib import Path
-          url = os.environ["DATASET_URL"].strip()
-          if not url.startswith("https://"):
-              raise SystemExit("Dataset URL must begin with https://")
-          request = Request(url, headers={"User-Agent": "CropSight-AI-training/1.0"})
-          with urlopen(request, timeout=90) as response:
-              data = response.read()
-          if len(data) < 1024 or not data.startswith(b"PK"):
-              raise SystemExit("URL did not return a ZIP file. Use a direct HTTPS ZIP download URL.")
-          Path("dataset.zip").write_bytes(data)
-          print(f"Downloaded dataset ZIP: {len(data):,} bytes")
-          PY
+          curl --fail --location --retry 3 --output tomatod-DatasetNinja.tar "https://assets.supervisely.com/remote/eyJsaW5rIjogInMzOi8vc3VwZXJ2aXNlbHktZGF0YXNldHMvMTM0N190b21hdE9EL3RvbWF0b2QtRGF0YXNldE5pbmphLnRhciIsICJzaWciOiAiN2xsb1kwMlQ0VGRWL09kSFRUVW9kbHpscUlhQ3VXNFo5L2haejdRSUR4dz0ifQ==?response-content-disposition=attachment%3B%20filename%3D%22tomatod-DatasetNinja.tar%22"
+          test "$(stat -c%s tomatod-DatasetNinja.tar)" -gt 1000000
+          mkdir -p raw-dataset
+          tar -xf tomatod-DatasetNinja.tar -C raw-dataset
 
-      - name: Extract and prepare dataset YAML
+      - name: Convert dataset annotations to YOLO format
         run: |
           python - <<'PY'
+          import json, random, shutil
           from pathlib import Path
-          import zipfile, yaml
-          root = Path("training-data").resolve()
-          root.mkdir(parents=True, exist_ok=True)
-          with zipfile.ZipFile("dataset.zip") as zf:
-              zf.extractall(root)
-          yamls = list(root.rglob("dataset.yaml"))
-          if not yamls:
-              raise SystemExit("No dataset.yaml found in ZIP.")
-          source = yamls[0]
-          config = yaml.safe_load(source.read_text(encoding="utf-8"))
-          data_root = source.parent
-          for split in ("train", "val"):
-              p = data_root / "images" / split
-              if not p.is_dir():
-                  raise SystemExit(f"Missing required folder: {p}")
-              count = sum(1 for x in p.iterdir() if x.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
-              if count == 0:
-                  raise SystemExit(f"No images found in {p}")
-              print(f"{split}: {count} images")
-          names = config.get("names", {})
-          if isinstance(names, list):
-              names = {i: n for i, n in enumerate(names)}
-          if len(names) != 3:
-              raise SystemExit(f"Expected three maturity classes; got {names}")
-          config["path"] = str(data_root)
-          config["train"] = "images/train"
-          config["val"] = "images/val"
-          if (data_root / "images" / "test").is_dir():
-              config["test"] = "images/test"
-          config["names"] = names
-          Path("training-dataset.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-          print("Class mapping:", names)
+          from PIL import Image
+          random.seed(42)
+          root = Path("raw-dataset")
+          out = Path("training-data")
+          for split in ("train", "val", "test"):
+              (out / "images" / split).mkdir(parents=True, exist_ok=True)
+              (out / "labels" / split).mkdir(parents=True, exist_ok=True)
+          pairs = []
+          for ann in root.rglob("*.jpg.json"):
+              img = root / str(ann.relative_to(root)).replace("ann/", "img/").removesuffix(".json")
+              if img.exists():
+                  pairs.append((img, ann))
+          if not pairs:
+              raise SystemExit("No matching image/annotation pairs found in downloaded dataset.")
+          random.shuffle(pairs)
+          n = len(pairs)
+          train_end = int(n * 0.64)
+          val_end = int(n * 0.80)
+          splits = {"train": pairs[:train_end], "val": pairs[train_end:val_end], "test": pairs[val_end:]}
+          class_ids = {"fully-ripe": 0, "semi-ripe": 1, "unripe": 2}
+          for split, items in splits.items():
+              for img, ann in items:
+                  shutil.copy2(img, out / "images" / split / img.name)
+                  data = json.loads(ann.read_text(encoding="utf-8"))
+                  w = float(data["size"]["width"])
+                  h = float(data["size"]["height"])
+                  rows = []
+                  for obj in data.get("objects", []):
+                      cls = obj.get("classTitle")
+                      if cls not in class_ids or obj.get("geometryType") != "rectangle":
+                          continue
+                      ext = obj["points"]["exterior"]
+                      if len(ext) < 2: continue
+                      x1,y1 = ext[0]; x2,y2 = ext[1]
+                      x1,x2 = sorted((max(0,min(w,float(x1))),max(0,min(w,float(x2)))))
+                      y1,y2 = sorted((max(0,min(h,float(y1))),max(0,min(h,float(y2)))))
+                      bw,bh = (x2-x1)/w,(y2-y1)/h
+                      if bw <= 0 or bh <= 0: continue
+                      xc,yc = (x1+x2)/(2*w),(y1+y2)/(2*h)
+                      rows.append(f"{class_ids[cls]} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
+                  (out / "labels" / split / f"{img.stem}.txt").write_text("\n".join(rows), encoding="utf-8")
+              print(f"{split}: {len(items)} images")
+          (out / "dataset.yaml").write_text(
+              "path: .\ntrain: images/train\nval: images/val\ntest: images/test\nnames:\n  0: harvest_ready\n  1: nearly_ready\n  2: developing\n",
+              encoding="utf-8")
+          (out / "LICENSE.txt").write_text(
+              "Source dataset: tomatOD / DatasetNinja. License: CC BY-NC-SA 4.0.\n"
+              "Attribution: Tsironis V., Bourou S., Stentoumis C. (2020), tomatOD.\n"
+              "Non-commercial use only; share adaptations under the same license.\n"
+              "Ripeness classes are a proxy for harvest readiness.\n", encoding="utf-8")
           PY
 
       - name: Train YOLO model
@@ -104,33 +106,32 @@ jobs:
           if n < 1 or n > 150:
               raise SystemExit("Epochs must be between 1 and 150.")
           PY
-          python api/train.py --data training-dataset.yaml --epochs "${EPOCHS}" --imgsz 640 --batch 4
+          python api/train.py --data training-data/dataset.yaml --epochs "${EPOCHS}" --imgsz 640 --batch 4
 
-      - name: Evaluate trained weights
+      - name: Evaluate trained model and package output
         run: |
           python - <<'PY'
           from pathlib import Path
           from ultralytics import YOLO
-          import yaml
+          import shutil
           runs = Path("runs/cropsight/tomato-maturity")
           weights = runs / "weights" / "best.pt"
           if not weights.is_file():
               raise SystemExit(f"Training did not produce {weights}")
-          cfg = yaml.safe_load(Path("training-dataset.yaml").read_text())
           model = YOLO(str(weights))
-          metrics = model.val(data="training-dataset.yaml", split="val", imgsz=640, device="cpu")
+          metrics = model.val(data="training-data/dataset.yaml", split="val", imgsz=640, device="cpu")
           out = Path("model-output")
           out.mkdir(exist_ok=True)
-          import shutil
           shutil.copy2(weights, out / "best.pt")
           if (runs / "results.csv").exists():
               shutil.copy2(runs / "results.csv", out / "results.csv")
           (out / "MODEL_NOTES.txt").write_text(
-              "CropSight AI tomato maturity model\n"
-              "Class IDs: 0=harvest_ready, 1=nearly_ready, 2=developing (verify names in dataset YAML).\n"
-              "Dataset-derived maturity classes are a proxy and require independent field validation.\n"
-              "This artifact is not deployed automatically.\n",
-              encoding="utf-8")
+              "CropSight AI tomato maturity model.\n"
+              "Class IDs: 0=harvest_ready, 1=nearly_ready, 2=developing.\n"
+              "Dataset: tomatOD, CC BY-NC-SA 4.0. Non-commercial use only.\n"
+              "Ripeness classes are only a proxy for harvest readiness.\n"
+              "Not deployed automatically; validate on independent field images.\n"
+              f"Validation metrics: {metrics.results_dict}\n", encoding="utf-8")
           print("Validation metrics:", metrics.results_dict)
           PY
 
