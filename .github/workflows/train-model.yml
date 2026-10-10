@@ -87,7 +87,7 @@ jobs:
                   (out / "labels" / split / f"{img.stem}.txt").write_text("\n".join(rows), encoding="utf-8")
               print(f"{split}: {len(items)} images")
           (out / "dataset.yaml").write_text(
-              "path: .\ntrain: images/train\nval: images/val\ntest: images/test\nnames:\n  0: harvest_ready\n  1: nearly_ready\n  2: developing\n",
+              f"path: {out.resolve().as_posix()}\ntrain: images/train\nval: images/val\ntest: images/test\nnames:\n  0: harvest_ready\n  1: nearly_ready\n  2: developing\n",
               encoding="utf-8")
           (out / "LICENSE.txt").write_text(
               "Source dataset: tomatOD / DatasetNinja. License: CC BY-NC-SA 4.0.\n"
