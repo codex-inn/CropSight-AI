@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: cropsight-inference
+    runtime: docker
+    plan: starter
+    region: singapore
+    dockerfilePath: ./api/Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: CROPSIGHT_MODEL_PATH
+        value: /var/data/tomato-maturity.pt
+      - key: CORS_ORIGINS
+        value: https://codex-inn.github.io
+    disk:
+      name: cropsight-model
+      mountPath: /var/data
+      sizeGB: 1
