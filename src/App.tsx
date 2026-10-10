@@ -1,17 +1,30 @@
-import { useMemo, useState } from 'react';
-import { dashboardMetrics, fieldData, recentScans, reportSummary, sampleScanResult } from './data/mockData';
-import { calculateSummary, csvFromSummary, getHarvestWindowText, getStatusTone } from './lib/analytics';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { demoUser } from './data/demoData';
+import type { AnalysisResponse, AppSettings, Field, Scan } from './domain/models';
+import { buildReport, calculateSummary, estimateFieldHealth, getDominantStage, getHarvestWindowText } from './lib/analytics';
+import { downloadCsv, scansToCsv } from './lib/csv';
+import {
+  hydrateStorageIfEmpty,
+  loadFields,
+  loadScans,
+  loadSettings,
+  resetDemoData,
+  saveFields,
+  saveScans,
+  saveSettings,
+  storageMeta
+} from './lib/storage';
+import { createAnalysisAdapter } from './services/analysis';
 
-type ViewName = 'dashboard' | 'scan' | 'fields' | 'history' | 'reports';
+type ViewName = 'dashboard' | 'scan' | 'fields' | 'history' | 'reports' | 'settings';
 
-type ScanState = {
-  id: string;
-  field: string;
-  ready: number;
-  nearlyReady: number;
-  developing: number;
-  confidence: number;
-  date: string;
+type FieldForm = {
+  id?: string;
+  name: string;
+  crop: 'tomato';
+  variety: string;
+  acreage: string;
+  plantingDate: string;
 };
 
 const navItems: { id: ViewName; label: string; icon: string }[] = [
@@ -19,45 +32,282 @@ const navItems: { id: ViewName; label: string; icon: string }[] = [
   { id: 'scan', label: 'Scan crop', icon: '⌁' },
   { id: 'fields', label: 'My fields', icon: '⌖' },
   { id: 'history', label: 'Scan history', icon: '◷' },
-  { id: 'reports', label: 'Reports', icon: '▤' }
+  { id: 'reports', label: 'Reports', icon: '▤' },
+  { id: 'settings', label: 'Settings / Help', icon: '?' }
 ];
+
+const emptyFieldForm: FieldForm = { name: '', crop: 'tomato', variety: '', acreage: '', plantingDate: '' };
+
+const PAGE_SIZE = 8;
+
+function formatDateTime(dateIso: string) {
+  return new Date(dateIso).toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit'
+  });
+}
 
 function App() {
   const [currentView, setCurrentView] = useState<ViewName>('dashboard');
-  const [selectedImage, setSelectedImage] = useState<string | null>(null);
-  const [scanResult, setScanResult] = useState<ScanState | null>(null);
-  const [scanHistory, setScanHistory] = useState(recentScans);
-  const summary = useMemo(() => calculateSummary(scanHistory), [scanHistory]);
+  const [fields, setFields] = useState<Field[]>([]);
+  const [scans, setScans] = useState<Scan[]>([]);
+  const [settings, setSettings] = useState<AppSettings | null>(null);
 
-  const handleAnalyze = () => {
-    setScanResult({
-      id: 'CS-0249',
-      field: 'North Field · Row 04',
-      ready: 5,
-      nearlyReady: 4,
-      developing: 3,
-      confidence: 94,
-      date: 'Today, 9:52 AM'
-    });
-  };
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [selectedFieldId, setSelectedFieldId] = useState<string>('');
+  const [lastResult, setLastResult] = useState<AnalysisResponse | null>(null);
+  const [statusMessage, setStatusMessage] = useState('Ready. Upload a crop image to start analysis.');
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [scanLoading, setScanLoading] = useState(false);
 
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
+  const [fieldForm, setFieldForm] = useState<FieldForm>(emptyFieldForm);
+  const [fieldError, setFieldError] = useState<string | null>(null);
+  const [fieldModalOpen, setFieldModalOpen] = useState(false);
+
+  const [historySearch, setHistorySearch] = useState('');
+  const [historyFieldFilter, setHistoryFieldFilter] = useState('all');
+  const [historyMaturityFilter, setHistoryMaturityFilter] = useState<'all' | 'ready' | 'nearly' | 'developing'>('all');
+  const [historyPage, setHistoryPage] = useState(1);
+  const [selectedScanId, setSelectedScanId] = useState<string | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const cameraInputRef = useRef<HTMLInputElement | null>(null);
+
+  const adapter = useMemo(() => createAnalysisAdapter(), []);
+
+  useEffect(() => {
+    hydrateStorageIfEmpty();
+    const loadedFields = loadFields();
+    const loadedScans = loadScans();
+    const loadedSettings = loadSettings();
+    setFields(loadedFields);
+    setScans(loadedScans);
+    setSettings(loadedSettings);
+    setSelectedFieldId(loadedFields[0]?.id ?? '');
+  }, []);
+
+  useEffect(() => {
+    saveFields(fields);
+  }, [fields]);
+
+  useEffect(() => {
+    saveScans(scans);
+  }, [scans]);
+
+  useEffect(() => {
+    if (!settings) return;
+    saveSettings(settings);
+  }, [settings]);
+
+  useEffect(() => {
+    if (!selectedFile) {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      setPreviewUrl(null);
+      return;
+    }
+    const objectUrl = URL.createObjectURL(selectedFile);
+    setPreviewUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [selectedFile]);
+
+  const summary = useMemo(() => calculateSummary(scans), [scans]);
+  const report = useMemo(() => buildReport(scans, fields), [scans, fields]);
+  const selectedScan = useMemo(() => scans.find((scan) => scan.id === selectedScanId) ?? null, [scans, selectedScanId]);
+
+  const filteredScans = useMemo(() => {
+    const lower = historySearch.trim().toLowerCase();
+    return scans
+      .filter((scan) => {
+        if (historyFieldFilter !== 'all' && scan.fieldId !== historyFieldFilter) return false;
+        const dominant = getDominantStage(scan);
+        if (historyMaturityFilter !== 'all' && dominant !== historyMaturityFilter) return false;
+        if (!lower) return true;
+        return [scan.id, scan.fieldName, scan.fileName].some((v) => v.toLowerCase().includes(lower));
+      })
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  }, [historyFieldFilter, historyMaturityFilter, historySearch, scans]);
+
+  const pageCount = Math.max(1, Math.ceil(filteredScans.length / PAGE_SIZE));
+  const pagedScans = filteredScans.slice((historyPage - 1) * PAGE_SIZE, historyPage * PAGE_SIZE);
+
+  useEffect(() => {
+    setHistoryPage(1);
+  }, [historySearch, historyFieldFilter, historyMaturityFilter]);
+
+  const onFileChosen = (file: File | null) => {
+    setScanError(null);
     if (!file) return;
-    const objectUrl = URL.createObjectURL(file);
-    setSelectedImage(objectUrl);
-    setScanResult(null);
+    const maxMb = settings?.maxUploadMb ?? 10;
+    const maxBytes = maxMb * 1024 * 1024;
+    const validTypes = ['image/jpeg', 'image/png', 'image/webp'];
+
+    if (!validTypes.includes(file.type)) {
+      setScanError('Unsupported file type. Use JPG, PNG, or WEBP.');
+      setStatusMessage('Upload failed: unsupported file type.');
+      return;
+    }
+
+    if (file.size > maxBytes) {
+      setScanError(`File too large. Maximum size is ${maxMb} MB.`);
+      setStatusMessage('Upload failed: file size exceeded limit.');
+      return;
+    }
+
+    setSelectedFile(file);
+    setLastResult(null);
+    setStatusMessage(`Selected ${file.name}. Ready to analyze.`);
   };
 
-  const downloadCsv = () => {
-    const blob = new Blob([csvFromSummary(scanHistory)], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'cropsight-report.csv';
-    link.click();
-    URL.revokeObjectURL(url);
+  const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    onFileChosen(event.dataTransfer.files?.[0] ?? null);
   };
+
+  const openFieldForm = (field?: Field) => {
+    if (field) {
+      setFieldForm({
+        id: field.id,
+        name: field.name,
+        crop: field.crop,
+        variety: field.variety,
+        acreage: String(field.acreage),
+        plantingDate: field.plantingDate
+      });
+    } else {
+      setFieldForm(emptyFieldForm);
+    }
+    setFieldError(null);
+    setFieldModalOpen(true);
+  };
+
+  const submitField = (event: React.FormEvent) => {
+    event.preventDefault();
+    const acreage = Number(fieldForm.acreage);
+    if (!fieldForm.name.trim() || !fieldForm.variety.trim()) {
+      setFieldError('Field name and variety are required.');
+      return;
+    }
+    if (!Number.isFinite(acreage) || acreage <= 0) {
+      setFieldError('Acreage must be greater than zero.');
+      return;
+    }
+    if (!fieldForm.plantingDate) {
+      setFieldError('Planting date is required.');
+      return;
+    }
+
+    const now = new Date().toISOString();
+    if (fieldForm.id) {
+      setFields((prev) =>
+        prev.map((field) =>
+          field.id === fieldForm.id
+            ? {
+                ...field,
+                name: fieldForm.name.trim(),
+                variety: fieldForm.variety.trim(),
+                acreage,
+                plantingDate: fieldForm.plantingDate,
+                updatedAt: now
+              }
+            : field
+        )
+      );
+    } else {
+      const newField: Field = {
+        id: `field-${crypto.randomUUID()}`,
+        name: fieldForm.name.trim(),
+        crop: 'tomato',
+        variety: fieldForm.variety.trim(),
+        acreage,
+        plantingDate: fieldForm.plantingDate,
+        createdAt: now,
+        updatedAt: now
+      };
+      setFields((prev) => [newField, ...prev]);
+      setSelectedFieldId((current) => current || newField.id);
+    }
+
+    setFieldModalOpen(false);
+    setFieldForm(emptyFieldForm);
+  };
+
+  const deleteField = (fieldId: string) => {
+    setFields((prev) => {
+      const next = prev.filter((field) => field.id !== fieldId);
+      if (selectedFieldId === fieldId) setSelectedFieldId(next[0]?.id ?? '');
+      return next;
+    });
+    setScans((prev) => prev.filter((scan) => scan.fieldId !== fieldId));
+  };
+
+  const analyzeCrop = async () => {
+    if (!selectedFile || !selectedFieldId) {
+      setScanError('Choose an image and a field before analysis.');
+      return;
+    }
+
+    const activeField = fields.find((field) => field.id === selectedFieldId);
+    if (!activeField) {
+      setScanError('Selected field no longer exists.');
+      return;
+    }
+
+    setScanLoading(true);
+    setScanError(null);
+    setStatusMessage('Analyzing crop image. Please wait.');
+
+    try {
+      const analysis = await adapter.analyzeCrop({
+        image: selectedFile,
+        cropType: activeField.crop,
+        fieldId: activeField.id
+      });
+
+      const newScan: Scan = {
+        id: `scan-${crypto.randomUUID()}`,
+        fieldId: activeField.id,
+        fieldName: activeField.name,
+        cropType: activeField.crop,
+        fileName: selectedFile.name,
+        createdAt: analysis.createdAt,
+        analysis
+      };
+
+      setScans((prev) => [newScan, ...prev]);
+      setLastResult(analysis);
+      setStatusMessage('Analysis complete. Scan saved to history.');
+      setCurrentView('scan');
+    } catch (error) {
+      setScanError(error instanceof Error ? error.message : 'Analysis failed.');
+      setStatusMessage('Analysis failed. Please retry.');
+    } finally {
+      setScanLoading(false);
+    }
+  };
+
+  const removeScan = (scanId: string) => setScans((prev) => prev.filter((scan) => scan.id !== scanId));
+
+  const clearHistory = () => {
+    setScans([]);
+    saveScans([]);
+    setSelectedScanId(null);
+  };
+
+  const runResetDemo = () => {
+    resetDemoData();
+    setFields(loadFields());
+    setScans(loadScans());
+    setSettings(loadSettings());
+    setStatusMessage('Demo data restored from defaults.');
+  };
+
+  const printReport = () => window.print();
+
+  const hasFields = fields.length > 0;
 
   return (
     <div className="app-shell">
@@ -66,37 +316,32 @@ function App() {
           <span className="brand-mark">✦</span>
           <div>
             <strong>CropSight</strong>
-            <small>AI agriculture intelligence</small>
+            <small>See Your Crop. Know Your Harvest.</small>
           </div>
         </div>
 
         <nav className="nav" aria-label="Primary navigation">
           {navItems.map((item) => (
-            <button
-              key={item.id}
-              className={`nav-button ${currentView === item.id ? 'active' : ''}`}
-              onClick={() => setCurrentView(item.id)}
-              type="button"
-            >
+            <button key={item.id} className={`nav-button ${currentView === item.id ? 'active' : ''}`} onClick={() => setCurrentView(item.id)} type="button">
               <span>{item.icon}</span>
               {item.label}
             </button>
           ))}
         </nav>
 
-        <div className="sidebar-note">
+        <div className="sidebar-note" role="status" aria-live="polite">
           <span className="pulse"></span>
           <div>
-            <strong>Demo workspace</strong>
-            <small>Model integration ready</small>
+            <strong>{adapter.mode === 'api' ? 'API analysis mode' : 'Demo analysis mode'}</strong>
+            <small>{adapter.mode === 'api' ? 'Using backend endpoint' : 'Deterministic mock fallback active'}</small>
           </div>
         </div>
 
         <div className="profile-box">
           <div className="avatar">AM</div>
           <div>
-            <strong>Alex Morgan</strong>
-            <small>Green Valley Farm</small>
+            <strong>{demoUser.name}</strong>
+            <small>{demoUser.farmName}</small>
           </div>
         </div>
       </aside>
@@ -104,32 +349,26 @@ function App() {
       <main className="main-panel">
         <header className="topbar">
           <div className="crumbs">
-            <button className="mobile-menu" type="button" aria-label="Toggle menu">
-              ☰
-            </button>
             <span>Workspace</span>
             <span>/</span>
-            <strong>
-              {navItems.find((item) => item.id === currentView)?.label ?? 'Dashboard'}
-            </strong>
+            <strong>{navItems.find((item) => item.id === currentView)?.label ?? 'Dashboard'}</strong>
           </div>
           <div className="top-actions">
-            <button type="button" className="ghost-button" aria-label="Notifications">
-              ⌁
-            </button>
-            <button type="button" className="date-pill">
-              October 10, 2026 <span>⌄</span>
-            </button>
+            <span className="pill" aria-label="model mode badge">
+              {adapter.mode === 'api' ? 'API mode' : 'Demo mode'}
+            </span>
           </div>
         </header>
+
+        <p className="sr-only" aria-live="polite">{statusMessage}</p>
 
         {currentView === 'dashboard' && (
           <section className="page-section">
             <div className="hero-panel">
               <div>
-                <p className="eyebrow">Saturday, October 10, 2026</p>
+                <p className="eyebrow">Dashboard overview</p>
                 <h1>Good morning, Alex.</h1>
-                <p className="subtle">Your fields are looking healthy. Here is the latest crop intelligence for your farm.</p>
+                <p className="subtle">Live metrics are calculated from your persisted scan history.</p>
               </div>
               <button type="button" className="primary-button" onClick={() => setCurrentView('scan')}>
                 + Scan a crop
@@ -137,81 +376,64 @@ function App() {
             </div>
 
             <div className="metrics-grid">
-              {dashboardMetrics.map((metric) => (
-                <article key={metric.label} className="metric-card">
-                  <div className={`metric-icon ${metric.tone}`}>{metric.icon}</div>
-                  <span>{metric.label}</span>
-                  <strong>{metric.value}</strong>
-                  <small className={metric.change >= 0 ? 'positive' : 'negative'}>
-                    {metric.change >= 0 ? '↑' : '↓'} {Math.abs(metric.change)}%<em>vs last month</em>
-                  </small>
-                </article>
-              ))}
+              <article className="metric-card">
+                <div className="metric-icon green">⌁</div>
+                <span>Total scans</span>
+                <strong>{summary.totalScans}</strong>
+              </article>
+              <article className="metric-card">
+                <div className="metric-icon tomato">◉</div>
+                <span>Harvest-ready detections</span>
+                <strong>{summary.ready}</strong>
+              </article>
+              <article className="metric-card">
+                <div className="metric-icon amber">◌</div>
+                <span>Nearly-ready detections</span>
+                <strong>{summary.nearly}</strong>
+              </article>
+              <article className="metric-card">
+                <div className="metric-icon blue">◍</div>
+                <span>Average confidence</span>
+                <strong>{summary.avgConfidence}%</strong>
+              </article>
             </div>
 
             <div className="two-column">
               <article className="panel">
                 <div className="panel-header">
                   <div>
-                    <p className="eyebrow">Harvest outlook</p>
-                    <h2>Upcoming harvest forecast</h2>
-                  </div>
-                  <button type="button" className="text-button" onClick={() => setCurrentView('reports')}>View report →</button>
-                </div>
-
-                <div className="forecast-box">
-                  <div className="forecast-date">
-                    <span>18</span>
-                    <small>OCT<br />2026</small>
-                  </div>
-                  <div>
-                    <strong>Peak harvest window</strong>
-                    <p>Based on current maturity across the monitored fields.</p>
-                  </div>
-                  <span className="pill">8 days away</span>
-                </div>
-
-                <div className="chart" aria-label="Forecast line chart">
-                  <div className="chart-scale">
-                    <span>60</span>
-                    <span>40</span>
-                    <span>20</span>
-                    <span>0</span>
-                  </div>
-                  <div className="bars">
-                    <i style={{ height: '35%' }} />
-                    <i style={{ height: '48%' }} />
-                    <i style={{ height: '43%' }} />
-                    <i style={{ height: '63%' }} />
-                    <i style={{ height: '82%' }} className="highlight" />
-                    <i style={{ height: '68%' }} />
-                    <i style={{ height: '55%' }} />
+                    <p className="eyebrow">Forecast summary</p>
+                    <h2>Harvest timing</h2>
                   </div>
                 </div>
+                <p>
+                  Current maturity mix from {summary.totalDetections} detections indicates a peak window around{' '}
+                  {scans[0] ? getHarvestWindowText(scans[0].analysis.forecast) : 'not enough data'}.
+                </p>
+                <p className="small-note">Always validate with in-field observation and agronomy expertise.</p>
               </article>
 
               <article className="panel">
                 <div className="panel-header">
                   <div>
-                    <p className="eyebrow">Recent activity</p>
-                    <h2>Latest scans</h2>
+                    <p className="eyebrow">Recent scans</p>
+                    <h2>Latest activity</h2>
                   </div>
-                  <button type="button" className="text-button" onClick={() => setCurrentView('history')}>See all →</button>
+                  <button className="text-button" type="button" onClick={() => setCurrentView('history')}>
+                    View all →
+                  </button>
                 </div>
-
                 <div className="activity-list">
-                  {scanHistory.slice(0, 3).map((scan) => (
+                  {scans.slice(0, 4).map((scan) => (
                     <div key={scan.id} className="activity-item">
-                      <span className={`crop-bullet ${getStatusTone(scan.ready, scan.nearlyReady, scan.developing)}`} />
+                      <span className={`crop-bullet ${getDominantStage(scan)}`} />
                       <div>
-                        <strong>{scan.field}</strong>
-                        <small>{scan.date}</small>
+                        <strong>{scan.fieldName}</strong>
+                        <small>{formatDateTime(scan.createdAt)}</small>
                       </div>
-                      <span className={`status-tag ${getStatusTone(scan.ready, scan.nearlyReady, scan.developing)}`}>
-                        {scan.ready >= scan.nearlyReady ? 'Ready' : scan.nearlyReady >= scan.developing ? 'Nearly ready' : 'Developing'}
-                      </span>
                     </div>
                   ))}
+                  {!scans.length && <p>No scans yet. Go to “Scan crop” to create your first analysis.</p>}
                 </div>
               </article>
             </div>
@@ -221,40 +443,42 @@ function App() {
                 <p className="eyebrow">Field health</p>
                 <h2>Your fields</h2>
               </div>
-              <button type="button" className="secondary-button" onClick={() => setCurrentView('fields')}>Manage fields</button>
+              <button className="secondary-button" type="button" onClick={() => setCurrentView('fields')}>
+                Manage fields
+              </button>
             </div>
 
             <div className="field-grid">
-              {fieldData.map((field) => (
-                <article key={field.name} className="field-card">
-                  <div className="field-top">
-                    <div>
-                      <span className="field-badge">● Monitoring</span>
-                      <h3>{field.name}</h3>
-                      <small>{field.crop} · {field.variety}</small>
+              {fields.map((field) => {
+                const fieldScanCount = scans.filter((scan) => scan.fieldId === field.id).length;
+                const health = estimateFieldHealth(field, scans);
+                return (
+                  <article key={field.id} className="field-card">
+                    <div className="field-top">
+                      <div>
+                        <span className="field-badge">● Monitoring</span>
+                        <h3>{field.name}</h3>
+                        <small>
+                          {field.crop} · {field.variety}
+                        </small>
+                      </div>
                     </div>
-                    <span className="field-menu">•••</span>
-                  </div>
-                  <div className="field-health">
-                    <div>
-                      <span>Crop health</span>
-                      <strong>{field.health}%</strong>
+                    <div className="field-health">
+                      <div>
+                        <span>Field health</span>
+                        <strong>{health}%</strong>
+                      </div>
+                      <div className="progress-track">
+                        <i style={{ width: `${health}%` }} />
+                      </div>
                     </div>
-                    <div className="progress-track">
-                      <i style={{ width: `${field.health}%` }} />
+                    <div className="field-footer">
+                      <span>{field.acreage} acres</span>
+                      <span>{fieldScanCount} scans</span>
                     </div>
-                  </div>
-                  <div className="field-footer">
-                    <span>Last scanned {field.lastScanned}</span>
-                    <span>{field.acres} acres</span>
-                  </div>
-                </article>
-              ))}
-              <button type="button" className="add-field-card" onClick={() => setCurrentView('fields')}>
-                <span>＋</span>
-                <strong>Add a new field</strong>
-                <small>Start monitoring another field</small>
-              </button>
+                  </article>
+                );
+              })}
             </div>
           </section>
         )}
@@ -265,98 +489,145 @@ function App() {
               <div>
                 <p className="eyebrow">Crop analysis</p>
                 <h1>Scan a crop</h1>
-                <p>Upload a clear photo of your tomatoes to estimate maturity and harvest timing.</p>
+                <p>Upload or capture a tomato image, then run analysis. Demo mode is clearly labeled and not production accuracy.</p>
               </div>
             </div>
 
             <div className="scan-layout">
               <article className="panel upload-panel">
-                {!selectedImage ? (
-                  <div className="drop-zone">
-                    <div className="upload-icon">⇪</div>
-                    <h2>Drop an image here</h2>
-                    <p>or choose a photo from your device</p>
-                    <label className="primary-button upload-label">
-                      Choose image
-                      <input type="file" accept="image/*" onChange={handleFileChange} />
-                    </label>
-                    <small>JPG, PNG or WEBP · Max 10 MB</small>
-                  </div>
-                ) : (
-                  <div className="preview-box">
-                    <img src={selectedImage} alt="Selected crop preview" />
-                    <button type="button" className="remove-button" onClick={() => setSelectedImage(null)}>Remove image</button>
-                  </div>
-                )}
+                <label htmlFor="field-picker">Field</label>
+                <select id="field-picker" className="text-input" value={selectedFieldId} onChange={(e) => setSelectedFieldId(e.target.value)}>
+                  {fields.map((field) => (
+                    <option key={field.id} value={field.id}>
+                      {field.name}
+                    </option>
+                  ))}
+                </select>
 
-                <button
-                  type="button"
-                  className="primary-button full-width"
-                  onClick={handleAnalyze}
-                  disabled={!selectedImage}
+                <div
+                  className="drop-zone"
+                  onDrop={handleDrop}
+                  onDragOver={(event) => event.preventDefault()}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      fileInputRef.current?.click();
+                    }
+                  }}
+                  aria-label="Drop image here or press enter to browse files"
                 >
-                  Analyze crop
+                  {!previewUrl ? (
+                    <>
+                      <div className="upload-icon">⇪</div>
+                      <h2>Drop an image here</h2>
+                      <p>or choose a photo from your device</p>
+                    </>
+                  ) : (
+                    <div className="preview-box">
+                      <img src={previewUrl} alt="Selected crop preview" />
+                      <button type="button" className="remove-button" onClick={() => setSelectedFile(null)}>
+                        Remove image
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <div className="button-row">
+                  <button type="button" className="secondary-button" onClick={() => fileInputRef.current?.click()}>
+                    Choose image
+                  </button>
+                  <button type="button" className="secondary-button" onClick={() => cameraInputRef.current?.click()}>
+                    Capture photo
+                  </button>
+                </div>
+
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  className="sr-only"
+                  aria-label="Upload crop image"
+                  onChange={(e) => onFileChosen(e.target.files?.[0] ?? null)}
+                />
+                <input
+                  ref={cameraInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  capture="environment"
+                  className="sr-only"
+                  aria-label="Capture crop image"
+                  onChange={(e) => onFileChosen(e.target.files?.[0] ?? null)}
+                />
+
+                {scanError && <p className="error-text">{scanError}</p>}
+
+                <button type="button" className="primary-button full-width" onClick={analyzeCrop} disabled={scanLoading || !selectedFile || !hasFields}>
+                  {scanLoading ? 'Analyzing…' : 'Analyze crop'}
                 </button>
+
+                {scanError && (
+                  <button type="button" className="ghost-button full-width" onClick={analyzeCrop}>
+                    Retry analysis
+                  </button>
+                )}
               </article>
 
               <article className="panel side-panel">
-                <p className="eyebrow">Better scans</p>
-                <h2>Capture tips</h2>
-                <ul className="tips-list">
-                  <li><span>01</span> Keep the camera steady and level.</li>
-                  <li><span>02</span> Use natural light and avoid harsh shadows.</li>
-                  <li><span>03</span> Include several fruits in the frame.</li>
-                  <li><span>04</span> Capture fruit color and surface clearly.</li>
-                </ul>
+                <p className="eyebrow">Mode and disclaimer</p>
+                <h2>Analysis boundary</h2>
+                <p className="small-note">
+                  Current mode: <strong>{adapter.mode === 'api' ? 'API' : 'Demo'}</strong>. CropSight AI is decision support only and must not replace field inspection.
+                </p>
                 <div className="demo-box">
-                  <strong>Demo analysis mode</strong>
-                  <p>This MVP uses deterministic sample results. A real vision model can be attached at the analysis boundary.</p>
+                  <strong>Important agricultural disclaimer</strong>
+                  <p>Predictions can be wrong under lighting, occlusion, cultivar differences, and weather variation. Always confirm with qualified growers.</p>
                 </div>
               </article>
             </div>
 
-            {scanResult && (
+            {lastResult && (
               <article className="panel analysis-panel">
                 <div className="panel-header">
                   <div>
-                    <p className="eyebrow">Analysis complete · demo result</p>
-                    <h2>Crop maturity overview</h2>
+                    <p className="eyebrow">Analysis complete</p>
+                    <h2>Maturity overview</h2>
                   </div>
-                  <span className="pill">Confidence {scanResult.confidence}%</span>
+                  <span className="pill">Confidence {lastResult.confidence}%</span>
                 </div>
 
                 <div className="result-grid">
                   <div className="result-stat">
-                    <div className="metric-icon tomato">◉</div>
-                    <strong>{scanResult.ready + scanResult.nearlyReady + scanResult.developing}</strong>
-                    <small>Tomatoes detected</small>
+                    <strong>{lastResult.detections.length}</strong>
+                    <small>Total detections</small>
                   </div>
                   <div className="result-stat">
-                    <div className="metric-icon green">✓</div>
-                    <strong>{scanResult.ready}</strong>
+                    <strong>{lastResult.maturityCounts.harvestReady}</strong>
                     <small>Harvest-ready</small>
                   </div>
                   <div className="result-stat">
-                    <div className="metric-icon amber">◌</div>
-                    <strong>{scanResult.nearlyReady}</strong>
+                    <strong>{lastResult.maturityCounts.nearlyReady}</strong>
                     <small>Nearly ready</small>
                   </div>
                   <div className="result-stat">
-                    <div className="metric-icon blue">◍</div>
-                    <strong>{scanResult.developing}</strong>
+                    <strong>{lastResult.maturityCounts.developing}</strong>
                     <small>Developing</small>
                   </div>
                 </div>
 
                 <div className="result-footer">
                   <div>
-                    <strong>Estimated harvest window</strong>
-                    <p>{getHarvestWindowText(scanResult.ready, scanResult.nearlyReady, scanResult.developing)}</p>
+                    <strong>Forecast window</strong>
+                    <p>{getHarvestWindowText(lastResult.forecast)}</p>
                   </div>
-                  <span className="status-tag ready">Ready to plan</span>
+                  <span className="status-tag ready">Model {lastResult.model.mode} · {lastResult.model.version}</span>
                 </div>
 
-                <p className="small-note">ⓘ Sample result for product demonstration. CropSight AI predictions should be reviewed by a qualified grower and are not a substitute for field inspection.</p>
+                {lastResult.confidence < (settings?.lowConfidenceThreshold ?? 75) && (
+                  <p className="warning-text">Low confidence warning: review this scan manually before planning harvest operations.</p>
+                )}
+                <p className="small-note">{lastResult.warnings.join(' ')}</p>
               </article>
             )}
           </section>
@@ -368,43 +639,60 @@ function App() {
               <div>
                 <p className="eyebrow">Field management</p>
                 <h1>My fields</h1>
-                <p>Keep your growing areas organized and monitor crop health over time.</p>
+                <p>Add, edit, or delete fields. Data is stored locally in your browser using namespaced keys.</p>
               </div>
-              <button type="button" className="primary-button">+ Add field</button>
-            </div>
-
-            <div className="field-grid large">
-              {fieldData.map((field) => (
-                <article key={field.name} className="field-card">
-                  <div className="field-top">
-                    <div>
-                      <span className="field-badge">● Monitoring</span>
-                      <h3>{field.name}</h3>
-                      <small>{field.crop} · {field.variety}</small>
-                    </div>
-                    <span className="field-menu">•••</span>
-                  </div>
-                  <div className="field-health">
-                    <div>
-                      <span>Crop health</span>
-                      <strong>{field.health}%</strong>
-                    </div>
-                    <div className="progress-track">
-                      <i style={{ width: `${field.health}%` }} />
-                    </div>
-                  </div>
-                  <div className="field-footer">
-                    <span>{field.acres} acres</span>
-                    <span>{field.scans} scans</span>
-                  </div>
-                </article>
-              ))}
-              <button type="button" className="add-field-card tall">
-                <span>＋</span>
-                <strong>Add a new field</strong>
-                <small>Start monitoring another field</small>
+              <button type="button" className="primary-button" onClick={() => openFieldForm()}>
+                + Add field
               </button>
             </div>
+
+            {!fields.length ? (
+              <article className="panel">
+                <h2>No fields yet</h2>
+                <p>Create your first field to start crop scans.</p>
+              </article>
+            ) : (
+              <div className="field-grid large">
+                {fields.map((field) => {
+                  const scanCount = scans.filter((scan) => scan.fieldId === field.id).length;
+                  const health = estimateFieldHealth(field, scans);
+                  return (
+                    <article key={field.id} className="field-card">
+                      <div className="field-top">
+                        <div>
+                          <span className="field-badge">● {field.crop}</span>
+                          <h3>{field.name}</h3>
+                          <small>
+                            {field.variety} · planted {field.plantingDate}
+                          </small>
+                        </div>
+                      </div>
+                      <div className="field-health">
+                        <div>
+                          <span>Field health</span>
+                          <strong>{health}%</strong>
+                        </div>
+                        <div className="progress-track">
+                          <i style={{ width: `${health}%` }} />
+                        </div>
+                      </div>
+                      <div className="field-footer">
+                        <span>{field.acreage} acres</span>
+                        <span>{scanCount} scans</span>
+                      </div>
+                      <div className="button-row">
+                        <button type="button" className="ghost-button" onClick={() => openFieldForm(field)}>
+                          Edit
+                        </button>
+                        <button type="button" className="ghost-button" onClick={() => deleteField(field.id)}>
+                          Delete
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
           </section>
         )}
 
@@ -412,78 +700,153 @@ function App() {
           <section className="page-section">
             <div className="page-header">
               <div>
-                <p className="eyebrow">Field observations</p>
+                <p className="eyebrow">Scan records</p>
                 <h1>Scan history</h1>
-                <p>Review previous crop analyses and maturity trends.</p>
+                <p>Search and filter persisted scans with detail view and cleanup actions.</p>
               </div>
-              <button type="button" className="secondary-button" onClick={() => setCurrentView('reports')}>Export data</button>
+              <button type="button" className="secondary-button" onClick={clearHistory} disabled={!scans.length}>
+                Clear history
+              </button>
             </div>
 
             <article className="panel history-panel">
               <div className="table-toolbar">
-                <div className="search-box">⌕ <input aria-label="Search scans" placeholder="Search scans" /></div>
-                <button type="button" className="ghost-button small">All fields ⌄</button>
+                <div className="search-box">
+                  ⌕{' '}
+                  <input value={historySearch} onChange={(event) => setHistorySearch(event.target.value)} aria-label="Search scans" placeholder="Search by scan, field, or file" />
+                </div>
+                <select className="text-input small-input" value={historyFieldFilter} onChange={(e) => setHistoryFieldFilter(e.target.value)}>
+                  <option value="all">All fields</option>
+                  {fields.map((field) => (
+                    <option key={field.id} value={field.id}>
+                      {field.name}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className="text-input small-input"
+                  value={historyMaturityFilter}
+                  onChange={(e) => setHistoryMaturityFilter(e.target.value as 'all' | 'ready' | 'nearly' | 'developing')}
+                >
+                  <option value="all">All maturity</option>
+                  <option value="ready">Ready</option>
+                  <option value="nearly">Nearly</option>
+                  <option value="developing">Developing</option>
+                </select>
               </div>
 
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Scan</th>
-                      <th>Field</th>
-                      <th>Detected</th>
-                      <th>Maturity mix</th>
-                      <th>Confidence</th>
-                      <th>Date</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {scanHistory.map((scan) => (
-                      <tr key={scan.id}>
-                        <td><span className="scan-id">{scan.id}</span></td>
-                        <td>{scan.field}</td>
-                        <td>{scan.ready + scan.nearlyReady + scan.developing} tomatoes</td>
-                        <td>
-                          <span className="status-tag ready">{scan.ready} ready</span>
-                          <span className="status-tag nearly">{scan.nearlyReady} near</span>
-                        </td>
-                        <td>{scan.confidence}%</td>
-                        <td>{scan.date}</td>
+              {!pagedScans.length ? (
+                <div className="empty-state">No scan records match this filter.</div>
+              ) : (
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Scan</th>
+                        <th>Field</th>
+                        <th>Detected</th>
+                        <th>Confidence</th>
+                        <th>Mode</th>
+                        <th>Date</th>
+                        <th>Actions</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {pagedScans.map((scan) => {
+                        const counts = scan.analysis.maturityCounts;
+                        const total = counts.harvestReady + counts.nearlyReady + counts.developing;
+                        return (
+                          <tr key={scan.id}>
+                            <td>
+                              <span className="scan-id">{scan.id.slice(0, 12)}</span>
+                            </td>
+                            <td>{scan.fieldName}</td>
+                            <td>{total} tomatoes</td>
+                            <td>{scan.analysis.confidence}%</td>
+                            <td>{scan.analysis.model.mode}</td>
+                            <td>{formatDateTime(scan.createdAt)}</td>
+                            <td>
+                              <button type="button" className="text-button" onClick={() => setSelectedScanId(scan.id)}>
+                                Details
+                              </button>
+                              <button type="button" className="text-button" onClick={() => removeScan(scan.id)}>
+                                Delete
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div className="pagination-row">
+                <button type="button" className="ghost-button small" disabled={historyPage <= 1} onClick={() => setHistoryPage((p) => Math.max(1, p - 1))}>
+                  Prev
+                </button>
+                <span>
+                  Page {historyPage} of {pageCount}
+                </span>
+                <button type="button" className="ghost-button small" disabled={historyPage >= pageCount} onClick={() => setHistoryPage((p) => Math.min(pageCount, p + 1))}>
+                  Next
+                </button>
               </div>
             </article>
+
+            {selectedScan && (
+              <article className="panel" aria-live="polite">
+                <div className="panel-header">
+                  <h2>Scan detail</h2>
+                  <button type="button" className="ghost-button" onClick={() => setSelectedScanId(null)}>
+                    Close
+                  </button>
+                </div>
+                <p>
+                  <strong>Field:</strong> {selectedScan.fieldName}
+                </p>
+                <p>
+                  <strong>File:</strong> {selectedScan.fileName}
+                </p>
+                <p>
+                  <strong>Forecast:</strong> {getHarvestWindowText(selectedScan.analysis.forecast)}
+                </p>
+                <p>
+                  <strong>Warnings:</strong> {selectedScan.analysis.warnings.join(' ')}
+                </p>
+              </article>
+            )}
           </section>
         )}
 
         {currentView === 'reports' && (
-          <section className="page-section">
+          <section className="page-section print-area">
             <div className="page-header">
               <div>
-                <p className="eyebrow">Insights & exports</p>
+                <p className="eyebrow">Insights and exports</p>
                 <h1>Reports</h1>
-                <p>Turn your crop observations into clear harvest planning decisions.</p>
+                <p>Generated from persisted scans and fields. Export CSV or print this report view.</p>
               </div>
-              <button type="button" className="primary-button" onClick={downloadCsv}>↓ Download CSV</button>
+              <div className="button-row">
+                <button type="button" className="secondary-button" onClick={() => downloadCsv('cropsight-report.csv', scansToCsv(scans))}>
+                  ↓ Download CSV
+                </button>
+                <button type="button" className="primary-button" onClick={printReport}>
+                  Print report
+                </button>
+              </div>
             </div>
 
             <div className="report-grid">
               <article className="panel report-card green-panel">
-                <div className="metric-icon green">▤</div>
-                <p className="eyebrow">Monthly summary</p>
-                <h2>October field report</h2>
-                <p>{reportSummary.totalScans} crop scans across {reportSummary.activeFields} active tomato fields.</p>
-                <button type="button" className="text-button" onClick={downloadCsv}>Download report →</button>
+                <p className="eyebrow">Summary card</p>
+                <h2>{report.totalScans} scans recorded</h2>
+                <p>{report.activeFields} active fields with tomato monitoring.</p>
               </article>
-
               <article className="panel report-card tomato-panel">
-                <div className="metric-icon tomato">◉</div>
-                <p className="eyebrow">Harvest planning</p>
-                <h2>{reportSummary.harvestReady} crops ready soon</h2>
-                <p>Your next peak harvest window begins {reportSummary.harvestWindow}.</p>
-                <button type="button" className="text-button" onClick={() => setCurrentView('scan')}>Run another scan →</button>
+                <p className="eyebrow">Forecast card</p>
+                <h2>{summary.readyShare}% harvest-ready share</h2>
+                <p>Average model confidence across scans: {summary.avgConfidence}%.</p>
               </article>
             </div>
 
@@ -493,27 +856,142 @@ function App() {
                   <p className="eyebrow">Maturity distribution</p>
                   <h2>Current crop mix</h2>
                 </div>
-                <span className="pill">{summary.total} total detections</span>
+                <span className="pill">{summary.totalDetections} detections</span>
               </div>
 
               <div className="distribution-list">
                 <div>
-                  <div className="label-row"><span><i className="legend ready-dot" />Harvest-ready</span><strong>{summary.readyShare}%</strong></div>
-                  <div className="meter"><i style={{ width: `${summary.readyShare}%`, background: '#e76f51' }} /></div>
+                  <div className="label-row">
+                    <span>
+                      <i className="legend ready-dot" />Harvest-ready
+                    </span>
+                    <strong>{summary.readyShare}%</strong>
+                  </div>
+                  <div className="meter">
+                    <i style={{ width: `${summary.readyShare}%`, background: '#e76f51' }} />
+                  </div>
                 </div>
                 <div>
-                  <div className="label-row"><span><i className="legend nearly-dot" />Nearly ready</span><strong>{summary.nearlyShare}%</strong></div>
-                  <div className="meter"><i style={{ width: `${summary.nearlyShare}%`, background: '#e9b949' }} /></div>
+                  <div className="label-row">
+                    <span>
+                      <i className="legend nearly-dot" />Nearly ready
+                    </span>
+                    <strong>{summary.nearlyShare}%</strong>
+                  </div>
+                  <div className="meter">
+                    <i style={{ width: `${summary.nearlyShare}%`, background: '#e9b949' }} />
+                  </div>
                 </div>
                 <div>
-                  <div className="label-row"><span><i className="legend developing-dot" />Developing</span><strong>{summary.developingShare}%</strong></div>
-                  <div className="meter"><i style={{ width: `${summary.developingShare}%`, background: '#72a98f' }} /></div>
+                  <div className="label-row">
+                    <span>
+                      <i className="legend developing-dot" />Developing
+                    </span>
+                    <strong>{summary.developingShare}%</strong>
+                  </div>
+                  <div className="meter">
+                    <i style={{ width: `${summary.developingShare}%`, background: '#72a98f' }} />
+                  </div>
                 </div>
               </div>
             </article>
           </section>
         )}
+
+        {currentView === 'settings' && settings && (
+          <section className="page-section">
+            <div className="page-header">
+              <div>
+                <p className="eyebrow">Settings and help</p>
+                <h1>Settings / Help</h1>
+                <p>Understand mode, storage, and API contract guidance.</p>
+              </div>
+            </div>
+
+            <article className="panel">
+              <h2>Runtime mode</h2>
+              <p>
+                Current mode: <strong>{adapter.mode === 'api' ? 'API' : 'Demo'}</strong>
+              </p>
+              <p>
+                Configured API base URL: <code>{settings.apiBaseUrl ?? 'Not configured'}</code>
+              </p>
+              <p className="small-note">No secrets are stored in localStorage. Do not put API keys in client environment variables.</p>
+            </article>
+
+            <article className="panel">
+              <h2>Model disclaimer</h2>
+              <p>
+                CropSight AI provides decision support, not guaranteed agronomic truth. Treat all outputs as advisory and validate with field inspection.
+              </p>
+              <h3>Privacy and storage</h3>
+              <p>
+                Data is persisted only in your browser under namespace <code>{storageMeta.namespace}</code> with schema metadata version {storageMeta.version}.
+                Clearing browser storage removes records.
+              </p>
+              <button type="button" className="secondary-button" onClick={runResetDemo}>
+                Reset demo data
+              </button>
+            </article>
+
+            <article className="panel">
+              <h2>Keyboard and accessibility guidance</h2>
+              <ul>
+                <li>Use Tab/Shift+Tab to move through controls.</li>
+                <li>Press Enter/Space on upload drop-zone to open file picker.</li>
+                <li>Status updates are announced in a live region.</li>
+              </ul>
+              <h3>API contract guidance</h3>
+              <p>
+                POST <code>/api/v1/analyze</code> as multipart form-data with <code>image</code>, <code>crop_type</code>, <code>field_id</code>, optional <code>latitude</code>/<code>longitude</code>.
+                Response includes detections, maturity counts, confidence, forecast, model mode/version, warnings, and timestamp.
+              </p>
+            </article>
+          </section>
+        )}
       </main>
+
+      {fieldModalOpen && (
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-label="Field form dialog">
+          <form className="modal-card" onSubmit={submitField}>
+            <h2>{fieldForm.id ? 'Edit field' : 'Add field'}</h2>
+            <label>
+              Name
+              <input className="text-input" value={fieldForm.name} onChange={(e) => setFieldForm((prev) => ({ ...prev, name: e.target.value }))} />
+            </label>
+            <label>
+              Crop
+              <input className="text-input" value="tomato" disabled />
+            </label>
+            <label>
+              Variety
+              <input className="text-input" value={fieldForm.variety} onChange={(e) => setFieldForm((prev) => ({ ...prev, variety: e.target.value }))} />
+            </label>
+            <label>
+              Acreage
+              <input className="text-input" type="number" min="0" step="0.1" value={fieldForm.acreage} onChange={(e) => setFieldForm((prev) => ({ ...prev, acreage: e.target.value }))} />
+            </label>
+            <label>
+              Planting date
+              <input
+                className="text-input"
+                type="date"
+                value={fieldForm.plantingDate}
+                onChange={(e) => setFieldForm((prev) => ({ ...prev, plantingDate: e.target.value }))}
+              />
+            </label>
+            {fieldError && <p className="error-text">{fieldError}</p>}
+            <div className="button-row">
+              <button type="button" className="ghost-button" onClick={() => setFieldModalOpen(false)}>
+                Cancel
+              </button>
+              <button type="submit" className="primary-button">
+                Save field
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

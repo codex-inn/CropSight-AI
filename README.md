@@ -2,45 +2,136 @@
 
 **See Your Crop. Know Your Harvest.**
 
-CropSight AI is an agriculture intelligence dashboard for tomato maturity monitoring and harvest planning. This repository currently contains a responsive, dependency-free MVP prototype that can be opened directly in a browser.
+CropSight AI is a production-oriented React + TypeScript dashboard with a minimal FastAPI backend contract for crop maturity analysis. The current release supports **tomato** and explicitly distinguishes **Demo** vs **API** analysis mode.
 
-## Run locally
+> ⚠️ CropSight AI outputs are advisory only. This app does **not** claim production agronomic accuracy.
 
-Because the MVP is static, no install or environment variables are required:
+## Architecture
+
+- `src/` Frontend (React 18 + Vite + TypeScript)
+  - Dashboard, Scan Crop, My Fields, Scan History, Reports, Settings/Help
+  - Typed domain models
+  - localStorage persistence with schema metadata and safe fallback
+  - Analysis adapter boundary (`API adapter` or deterministic `mock adapter` fallback)
+- `backend/` FastAPI service
+  - `GET /health`
+  - `POST /api/v1/analyze` (multipart image + form fields)
+  - deterministic demo inference service interface (future YOLO/classifier integration point)
+
+## Frontend setup
 
 ```bash
-python3 -m http.server 8080
+npm install
+npm run dev
 ```
 
-Then open `http://localhost:8080`.
+Frontend default URL: `http://localhost:5173`
 
-You can also open `index.html` directly, although a local HTTP server is recommended for image preview behavior.
+### Frontend environment
 
-## Included MVP flows
+Copy `.env.example` to `.env` and set:
 
-- Dashboard with crop maturity metrics, harvest forecast, recent scans, and field health cards
-- Crop image upload with drag-and-drop, preview, validation, and demo analysis result
-- Deterministic sample tomato detections: harvest-ready, nearly ready, and developing
-- Scan history table
-- Field management view
-- Local CSV report download
-- Responsive mobile navigation and accessible labels
+- `VITE_API_BASE_URL` (optional)
+  - unset/empty => deterministic **Demo mode**
+  - set to backend URL => **API mode**
 
-## Demo limitation and model integration point
+## Backend setup
 
-The analysis action intentionally uses a deterministic sample result. No trained computer-vision model or external API is included, and the interface must not be treated as an agricultural diagnosis. The analysis boundary is the `analyzeButton` handler in `app.js`; replace its timeout/demo payload with a `fetch` call to a real inference service, then render the returned typed detection data in the result panel.
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
 
-A production implementation should add authentication, persistent storage, image object storage, a tomato detector/classifier, field-specific calibration, weather inputs, audit logs, and grower review workflows before making harvest recommendations.
+Backend URL: `http://localhost:8000`
 
-## Project structure
+## API contract
 
-- `index.html` — application markup and views
-- `styles.css` — responsive visual system
-- `app.js` — navigation, upload handling, demo analysis, and CSV export
+### `GET /health`
+Returns status metadata.
 
-## Product roadmap
+### `POST /api/v1/analyze`
+Multipart form-data fields:
+- `image` (JPG/PNG/WEBP, validated)
+- `crop_type` (`tomato`)
+- `field_id`
+- optional `latitude`, `longitude`
 
-1. Connect a tomato object-detection and maturity-classification API.
-2. Add a backend for users, fields, scans, and forecast history.
-3. Add mobile camera capture and offline upload queue.
-4. Add disease, pest, yield, and multi-crop models.
+Response includes:
+- detections
+- maturity counts
+- confidence
+- forecast
+- model mode/version
+- warnings
+- created timestamp
+
+## Persistence model (frontend)
+
+localStorage namespace: `cropsight.ai`
+
+Stored keys include schema/version envelope metadata:
+- `cropsight.ai.fields`
+- `cropsight.ai.scans`
+- `cropsight.ai.settings`
+
+Behavior:
+- safe parse with fallback defaults
+- migration-safe envelope handling
+- reset demo data action in Settings/Help
+- no secrets persisted
+
+## Reports and exports
+
+- Dashboard and Reports are computed from persisted scans
+- maturity distribution and forecast summary
+- CSV export uses escaping for commas/quotes/newlines
+- print-friendly report view
+
+## Accessibility and UX notes
+
+- keyboard navigation and upload controls
+- live region scan-status announcements
+- drag/drop + file picker + camera capture input
+- loading and retry states
+- low-confidence review warning
+- error boundary and empty/error states
+
+## Testing
+
+Frontend:
+```bash
+npm run test
+```
+
+Backend:
+```bash
+cd backend
+pytest
+```
+
+Build frontend:
+```bash
+npm run build
+```
+
+## Docker (optional)
+
+```bash
+docker compose up --build
+```
+
+## Security and privacy notes
+
+- Demo mode runs without external keys, model weights, or datasets.
+- Do not place API secrets in client-side env vars.
+- Uploaded images are processed in-memory by demo backend and not persisted by default.
+
+## Roadmap
+
+- Replace `DemoInferenceService` with trained detector/classifier service.
+- Add backend persistence (SQLModel/SQLAlchemy repositories for users/fields/scans/detections).
+- Add auth/roles, cloud storage, and model observability.
+- Extend to additional crops after tomato baseline validation.
