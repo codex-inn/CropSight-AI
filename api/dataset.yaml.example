@@ -1,0 +1,13 @@
+# Example only. Copy this file and set path to your own dataset root.
+# YOLO detection dataset layout:
+#   <path>/images/train, <path>/images/val, <path>/images/test
+#   <path>/labels/train, <path>/labels/val, <path>/labels/test
+path: C:/path/to/tomato-dataset
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: harvest_ready
+  1: nearly_ready
+  2: developing
