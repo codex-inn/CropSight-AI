@@ -27,6 +27,12 @@ function App() {
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [scanResult, setScanResult] = useState<ScanState | null>(null);
   const [scanHistory, setScanHistory] = useState(recentScans);
+  const [scanSearch, setScanSearch] = useState('');
+  const filteredScanHistory = useMemo(() => {
+    const query = scanSearch.trim().toLowerCase();
+    if (!query) return scanHistory;
+    return scanHistory.filter((scan) => `${scan.id} ${scan.field} ${scan.date}`.toLowerCase().includes(query));
+  }, [scanHistory, scanSearch]);
   const summary = useMemo(() => calculateSummary(scanHistory), [scanHistory]);
 
   const handleAnalyze = async () => {
@@ -42,7 +48,7 @@ function App() {
         const response = await fetch(`${apiBase}/api/v1/analyze`, { method: 'POST', body: formData });
         if (!response.ok) throw new Error(`Analysis API returned ${response.status}`);
         const result = await response.json();
-        setScanResult({
+        const liveScan: ScanState = {
           id: result.scan_id ?? 'CS-LIVE',
           field: result.field ?? 'Uploaded image',
           ready: Number(result.summary?.harvest_ready ?? 0),
@@ -50,7 +56,9 @@ function App() {
           developing: Number(result.summary?.developing ?? 0),
           confidence: Math.round(Number(result.summary?.mean_confidence ?? 0) * 100),
           date: new Date().toLocaleString()
-        });
+        };
+        setScanResult(liveScan);
+        setScanHistory((previous) => [liveScan, ...previous]);
         return;
       } catch (error) {
         console.error('CropSight inference API failed:', error);
@@ -58,15 +66,17 @@ function App() {
         return;
       }
     }
-    setScanResult({
-      id: 'CS-DEMO-0249',
+    const demoScan: ScanState = {
+      id: `CS-DEMO-${Date.now().toString().slice(-6)}`,
       field: 'Demo field · Uploaded image',
       ready: 5,
       nearlyReady: 4,
       developing: 3,
       confidence: 94,
       date: 'Demo · ' + new Date().toLocaleString()
-    });
+    };
+    setScanResult(demoScan);
+    setScanHistory((previous) => [demoScan, ...previous]);
   };
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -132,9 +142,6 @@ function App() {
       <main className="main-panel">
         <header className="topbar">
           <div className="crumbs">
-            <button className="mobile-menu" type="button" aria-label="Toggle menu">
-              ☰
-            </button>
             <span>Workspace</span>
             <span>/</span>
             <strong>
@@ -449,8 +456,8 @@ function App() {
 
             <article className="panel history-panel">
               <div className="table-toolbar">
-                <div className="search-box">⌕ <input aria-label="Search scans" placeholder="Search scans" /></div>
-                <button type="button" className="ghost-button small">All fields ⌄</button>
+                <div className="search-box">⌕ <input aria-label="Search scans" placeholder="Search by ID, field or date" value={scanSearch} onChange={(event) => setScanSearch(event.target.value)} /></div>
+                <span className="pill">{filteredScanHistory.length} scans</span>
               </div>
 
               <div className="table-wrap">
@@ -466,7 +473,7 @@ function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {scanHistory.map((scan) => (
+                    {filteredScanHistory.map((scan) => (
                       <tr key={scan.id}>
                         <td><span className="scan-id">{scan.id}</span></td>
                         <td>{scan.field}</td>
@@ -479,6 +486,7 @@ function App() {
                         <td>{scan.date}</td>
                       </tr>
                     ))}
+                    {filteredScanHistory.length === 0 && <tr><td colSpan={6}>No scans match your search.</td></tr>}
                   </tbody>
                 </table>
               </div>
