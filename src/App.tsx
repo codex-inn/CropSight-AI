@@ -29,15 +29,43 @@ function App() {
   const [scanHistory, setScanHistory] = useState(recentScans);
   const summary = useMemo(() => calculateSummary(scanHistory), [scanHistory]);
 
-  const handleAnalyze = () => {
+  const handleAnalyze = async () => {
+    if (!selectedImage) return;
+    // A configured inference API is used first. Without one, keep the clearly labelled demo.
+    const apiBase = import.meta.env.VITE_CROPSIGHT_API_URL?.replace(/\/$/, '');
+    if (apiBase) {
+      try {
+        const imageResponse = await fetch(selectedImage);
+        const imageBlob = await imageResponse.blob();
+        const formData = new FormData();
+        formData.append('file', imageBlob, 'crop-image.jpg');
+        const response = await fetch(`${apiBase}/api/v1/analyze`, { method: 'POST', body: formData });
+        if (!response.ok) throw new Error(`Analysis API returned ${response.status}`);
+        const result = await response.json();
+        setScanResult({
+          id: result.scan_id ?? 'CS-LIVE',
+          field: result.field ?? 'Uploaded image',
+          ready: Number(result.summary?.harvest_ready ?? 0),
+          nearlyReady: Number(result.summary?.nearly_ready ?? 0),
+          developing: Number(result.summary?.developing ?? 0),
+          confidence: Math.round(Number(result.summary?.mean_confidence ?? 0) * 100),
+          date: new Date().toLocaleString()
+        });
+        return;
+      } catch (error) {
+        console.error('CropSight inference API failed:', error);
+        window.alert('The CropSight AI service could not analyze this image. Check the API URL and model service, then try again. Demo results were not substituted.');
+        return;
+      }
+    }
     setScanResult({
-      id: 'CS-0249',
-      field: 'North Field · Row 04',
+      id: 'CS-DEMO-0249',
+      field: 'Demo field · Uploaded image',
       ready: 5,
       nearlyReady: 4,
       developing: 3,
       confidence: 94,
-      date: 'Today, 9:52 AM'
+      date: 'Demo · ' + new Date().toLocaleString()
     });
   };
 
