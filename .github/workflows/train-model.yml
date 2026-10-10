@@ -1,0 +1,143 @@
+name: Train CropSight tomato model
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_url:
+        description: "Direct HTTPS download URL for the converted YOLO dataset ZIP"
+        required: true
+        type: string
+      epochs:
+        description: "Training epochs (start with 30)"
+        required: true
+        default: "30"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: api/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r api/requirements.txt
+
+      - name: Download dataset ZIP
+        env:
+          DATASET_URL: ${{ inputs.dataset_url }}
+        run: |
+          python - <<'PY'
+          import os
+          from urllib.request import Request, urlopen
+          from pathlib import Path
+          url = os.environ["DATASET_URL"].strip()
+          if not url.startswith("https://"):
+              raise SystemExit("Dataset URL must begin with https://")
+          request = Request(url, headers={"User-Agent": "CropSight-AI-training/1.0"})
+          with urlopen(request, timeout=90) as response:
+              data = response.read()
+          if len(data) < 1024 or not data.startswith(b"PK"):
+              raise SystemExit("URL did not return a ZIP file. Use a direct HTTPS ZIP download URL.")
+          Path("dataset.zip").write_bytes(data)
+          print(f"Downloaded dataset ZIP: {len(data):,} bytes")
+          PY
+
+      - name: Extract and prepare dataset YAML
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile, yaml
+          root = Path("training-data").resolve()
+          root.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile("dataset.zip") as zf:
+              zf.extractall(root)
+          yamls = list(root.rglob("dataset.yaml"))
+          if not yamls:
+              raise SystemExit("No dataset.yaml found in ZIP.")
+          source = yamls[0]
+          config = yaml.safe_load(source.read_text(encoding="utf-8"))
+          data_root = source.parent
+          for split in ("train", "val"):
+              p = data_root / "images" / split
+              if not p.is_dir():
+                  raise SystemExit(f"Missing required folder: {p}")
+              count = sum(1 for x in p.iterdir() if x.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
+              if count == 0:
+                  raise SystemExit(f"No images found in {p}")
+              print(f"{split}: {count} images")
+          names = config.get("names", {})
+          if isinstance(names, list):
+              names = {i: n for i, n in enumerate(names)}
+          if len(names) != 3:
+              raise SystemExit(f"Expected three maturity classes; got {names}")
+          config["path"] = str(data_root)
+          config["train"] = "images/train"
+          config["val"] = "images/val"
+          if (data_root / "images" / "test").is_dir():
+              config["test"] = "images/test"
+          config["names"] = names
+          Path("training-dataset.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+          print("Class mapping:", names)
+          PY
+
+      - name: Train YOLO model
+        env:
+          EPOCHS: ${{ inputs.epochs }}
+        run: |
+          python - <<'PY'
+          import os
+          n = int(os.environ["EPOCHS"])
+          if n < 1 or n > 150:
+              raise SystemExit("Epochs must be between 1 and 150.")
+          PY
+          python api/train.py --data training-dataset.yaml --epochs "${EPOCHS}" --imgsz 640 --batch 4
+
+      - name: Evaluate trained weights
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from ultralytics import YOLO
+          import yaml
+          runs = Path("runs/cropsight/tomato-maturity")
+          weights = runs / "weights" / "best.pt"
+          if not weights.is_file():
+              raise SystemExit(f"Training did not produce {weights}")
+          cfg = yaml.safe_load(Path("training-dataset.yaml").read_text())
+          model = YOLO(str(weights))
+          metrics = model.val(data="training-dataset.yaml", split="val", imgsz=640, device="cpu")
+          out = Path("model-output")
+          out.mkdir(exist_ok=True)
+          import shutil
+          shutil.copy2(weights, out / "best.pt")
+          if (runs / "results.csv").exists():
+              shutil.copy2(runs / "results.csv", out / "results.csv")
+          (out / "MODEL_NOTES.txt").write_text(
+              "CropSight AI tomato maturity model\n"
+              "Class IDs: 0=harvest_ready, 1=nearly_ready, 2=developing (verify names in dataset YAML).\n"
+              "Dataset-derived maturity classes are a proxy and require independent field validation.\n"
+              "This artifact is not deployed automatically.\n",
+              encoding="utf-8")
+          print("Validation metrics:", metrics.results_dict)
+          PY
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cropsight-tomato-model
+          path: model-output/
+          if-no-files-found: error
+          retention-days: 14
