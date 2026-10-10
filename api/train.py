@@ -29,7 +29,7 @@ def main() -> None:
         "epochs": args.epochs,
         "imgsz": args.imgsz,
         "batch": args.batch,
-        "project": "runs/cropsight",
+        "project": str(Path("runs/cropsight").resolve()),
         "name": "tomato-maturity",
         "exist_ok": True,
         "patience": 15,
