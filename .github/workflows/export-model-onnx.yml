@@ -1,0 +1,72 @@
+name: Export CropSight Model to ONNX
+
+on:
+  workflow_dispatch:
+    inputs:
+      training_run_id:
+        description: "Successful training run ID containing cropsight-tomato-model"
+        required: true
+        default: "38075442283"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  export-onnx:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download trained model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cropsight-tomato-model
+          path: trained-model
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.training_run_id }}
+
+      - name: Locate checkpoint and export ONNX
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ultralytics
+          MODEL_PATH="$(find trained-model -type f -name 'best.pt' -print -quit)"
+          if [ -z "$MODEL_PATH" ]; then
+            echo "Could not find best.pt in the downloaded training artifact."
+            find trained-model -maxdepth 4 -type f -print
+            exit 1
+          fi
+          echo "Exporting checkpoint: $MODEL_PATH"
+          yolo export model="$MODEL_PATH" format=onnx imgsz=640
+          ONNX_PATH="${MODEL_PATH%.pt}.onnx"
+          if [ ! -f "$ONNX_PATH" ]; then
+            echo "Expected ONNX output not found at $ONNX_PATH"
+            find trained-model -maxdepth 4 -type f -print
+            exit 1
+          fi
+          mkdir -p exported
+          cp "$ONNX_PATH" exported/cropsight-tomato-maturity.onnx
+          cp "$MODEL_PATH" exported/best.pt
+          cat > exported/README.txt <<'EOF'
+          CropSight AI - exported YOLO model
+          Main model: cropsight-tomato-maturity.onnx
+          Source checkpoint: best.pt
+          Input size used during export: 640
+          Dataset note: trained using the tomatOD dataset. Dataset license is CC BY-NC-SA 4.0; use is non-commercial and adaptations must follow the same license.
+          This artifact is for model testing/export. It is not yet connected to the public CropSight AI website.
+          EOF
+
+      - name: Upload ONNX export artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cropsight-tomato-onnx
+          path: exported/
+          if-no-files-found: error
+          retention-days: 14
