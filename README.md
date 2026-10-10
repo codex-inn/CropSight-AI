@@ -18,17 +18,19 @@ The notebook trains a YOLO model, evaluates it on the validation split, and down
 
 ## Browser-triggered GitHub Actions training (no terminal / no Colab notebook)
 
-A manual workflow is available at **Actions → Train CropSight tomato model → Run workflow**:
+Open **Actions → Train CropSight tomato model → Run workflow**:
 https://github.com/codex-inn/CropSight-AI/actions/workflows/train-model.yml
 
-It requires a **direct HTTPS download URL** to the converted YOLO dataset ZIP. A normal web page, Google Drive preview page, or a file only on your computer will not work; the URL must return the ZIP file directly without an interactive sign-in. Enter an epoch count (start with 30), then run the workflow. It validates the ZIP and folder structure, trains YOLO on a GitHub-hosted CPU runner, evaluates the validation split, and stores the model as a workflow artifact for 14 days.
+The current workflow downloads the public tomatOD archive, converts its image annotations into YOLO labels, trains YOLO, evaluates the validation split, and uploads a `cropsight-tomato-model` artifact for 14 days. Run it from the `main` branch and start with 30 epochs.
 
 **Important limitations**
-- GitHub-hosted standard runners generally use CPU, so training may be slow and can time out. This workflow does not provision a GPU.
-- The dataset archive must be accessible to the runner through a direct HTTPS link. Do not commit the 163 MB dataset ZIP to the repository.
-- A successful workflow only creates a downloadable model artifact; it does not deploy the FastAPI service or connect it to GitHub Pages.
+- The standard GitHub-hosted runner is CPU-based; training may be slow or hit the six-hour job timeout.
+- The workflow has been committed, but a successful website deployment does **not** mean the model-training workflow has run.
+- A successful training run creates a downloadable model artifact only. It does not deploy the FastAPI service or connect the model to GitHub Pages.
+- The workflow assumes the public DatasetNinja archive retains the expected `ann/` and `img/` folder structure. If the source archive changes, the conversion step may fail; inspect the Actions log for the exact error.
 - The tomatOD dataset is CC BY-NC-SA 4.0. Follow attribution, share-alike and non-commercial terms. Ripeness labels are only a proxy for harvest readiness.
-- Never describe the model as reliable for harvest decisions until it has been tested on independent field images.
+- Do not treat predictions as reliable harvest recommendations until evaluated on independent field images.
+
 
 ## Local development
 
