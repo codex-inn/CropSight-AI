@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { dashboardMetrics, fieldData, recentScans, reportSummary, sampleScanResult } from './data/mockData';
 import { calculateSummary, csvFromSummary, getHarvestWindowText, getStatusTone } from './lib/analytics';
+import { analyzeTomatoImage } from './lib/onnxInference';
 
 type ViewName = 'dashboard' | 'scan' | 'fields' | 'history' | 'reports';
 
@@ -25,6 +26,9 @@ const navItems: { id: ViewName; label: string; icon: string }[] = [
 function App() {
   const [currentView, setCurrentView] = useState<ViewName>('dashboard');
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [scanResult, setScanResult] = useState<ScanState | null>(null);
   const [scanHistory, setScanHistory] = useState(recentScans);
   const [scanSearch, setScanSearch] = useState('');
@@ -36,54 +40,38 @@ function App() {
   const summary = useMemo(() => calculateSummary(scanHistory), [scanHistory]);
 
   const handleAnalyze = async () => {
-    if (!selectedImage) return;
-    // A configured inference API is used first. Without one, keep the clearly labelled demo.
-    const apiBase = import.meta.env.VITE_CROPSIGHT_API_URL?.replace(/\/$/, '');
-    if (apiBase) {
-      try {
-        const imageResponse = await fetch(selectedImage);
-        const imageBlob = await imageResponse.blob();
-        const formData = new FormData();
-        formData.append('file', imageBlob, 'crop-image.jpg');
-        const response = await fetch(`${apiBase}/api/v1/analyze`, { method: 'POST', body: formData });
-        if (!response.ok) throw new Error(`Analysis API returned ${response.status}`);
-        const result = await response.json();
-        const liveScan: ScanState = {
-          id: result.scan_id ?? 'CS-LIVE',
-          field: result.field ?? 'Uploaded image',
-          ready: Number(result.summary?.harvest_ready ?? 0),
-          nearlyReady: Number(result.summary?.nearly_ready ?? 0),
-          developing: Number(result.summary?.developing ?? 0),
-          confidence: Math.round(Number(result.summary?.mean_confidence ?? 0) * 100),
-          date: new Date().toLocaleString()
-        };
-        setScanResult(liveScan);
-        setScanHistory((previous) => [liveScan, ...previous]);
-        return;
-      } catch (error) {
-        console.error('CropSight inference API failed:', error);
-        window.alert('The CropSight AI service could not analyze this image. Check the API URL and model service, then try again. Demo results were not substituted.');
-        return;
-      }
+    if (!selectedFile) return;
+    setIsAnalyzing(true);
+    setAnalysisError(null);
+    try {
+      const result = await analyzeTomatoImage(selectedFile);
+      const liveScan: ScanState = {
+        id: 'CS-' + Date.now().toString().slice(-6),
+        field: selectedFile.name,
+        ready: result.harvest_ready,
+        nearlyReady: result.nearly_ready,
+        developing: result.developing,
+        confidence: Math.round(result.mean_confidence * 100),
+        date: new Date().toLocaleString()
+      };
+      setScanResult(liveScan);
+      setScanHistory((previous) => [liveScan, ...previous]);
+    } catch (error) {
+      console.error('Browser ONNX inference failed:', error);
+      setAnalysisError(error instanceof Error ? error.message : 'The model could not analyze this image.');
+    } finally {
+      setIsAnalyzing(false);
     }
-    const demoScan: ScanState = {
-      id: `CS-DEMO-${Date.now().toString().slice(-6)}`,
-      field: 'Demo field · Uploaded image',
-      ready: 5,
-      nearlyReady: 4,
-      developing: 3,
-      confidence: 94,
-      date: 'Demo · ' + new Date().toLocaleString()
-    };
-    setScanResult(demoScan);
-    setScanHistory((previous) => [demoScan, ...previous]);
   };
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
     const objectUrl = URL.createObjectURL(file);
+    if (selectedImage) URL.revokeObjectURL(selectedImage);
     setSelectedImage(objectUrl);
+    setSelectedFile(file);
+    setAnalysisError(null);
     setScanResult(null);
   };
 
@@ -320,7 +308,7 @@ function App() {
                 ) : (
                   <div className="preview-box">
                     <img src={selectedImage} alt="Selected crop preview" />
-                    <button type="button" className="remove-button" onClick={() => setSelectedImage(null)}>Remove image</button>
+                    <button type="button" className="remove-button" onClick={() => { if (selectedImage) URL.revokeObjectURL(selectedImage); setSelectedImage(null); setSelectedFile(null); setScanResult(null); setAnalysisError(null); }}>Remove image</button>
                   </div>
                 )}
 
@@ -328,9 +316,9 @@ function App() {
                   type="button"
                   className="primary-button full-width"
                   onClick={handleAnalyze}
-                  disabled={!selectedImage}
+                  disabled={!selectedFile || isAnalyzing}
                 >
-                  Analyze crop
+                  {isAnalyzing ? 'Analyzing with AI…' : 'Analyze crop'}
                 </button>
               </article>
 
@@ -344,17 +332,19 @@ function App() {
                   <li><span>04</span> Capture fruit color and surface clearly.</li>
                 </ul>
                 <div className="demo-box">
-                  <strong>Demo analysis mode</strong>
-                  <p>This MVP uses deterministic sample results. A real vision model can be attached at the analysis boundary.</p>
+                  <strong>Browser AI mode</strong>
+                  <p>Your photo is analyzed locally in this browser using the exported ONNX model. The first scan may take longer while the model loads.</p>
                 </div>
               </article>
             </div>
+
+            {analysisError && <article className="panel small-note" role="alert"><strong>AI analysis failed:</strong> {analysisError}. Confirm the ONNX model is published at public/models/cropsight-tomato-maturity.onnx and reload the site.</article>}
 
             {scanResult && (
               <article className="panel analysis-panel">
                 <div className="panel-header">
                   <div>
-                    <p className="eyebrow">Analysis complete · demo result</p>
+                    <p className="eyebrow">Analysis complete · browser model</p>
                     <h2>Crop maturity overview</h2>
                   </div>
                   <span className="pill">Confidence {scanResult.confidence}%</span>
@@ -391,7 +381,7 @@ function App() {
                   <span className="status-tag ready">Ready to plan</span>
                 </div>
 
-                <p className="small-note">ⓘ Sample result for product demonstration. CropSight AI predictions should be reviewed by a qualified grower and are not a substitute for field inspection.</p>
+                <p className="small-note">ⓘ Predictions are generated by the trained model in your browser. Results may be inaccurate; confirm maturity through field inspection.</p>
               </article>
             )}
           </section>
