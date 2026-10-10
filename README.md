@@ -10,6 +10,12 @@ The production build is deployed to GitHub Pages using GitHub Actions. After the
 
 https://codex-inn.github.io/CropSight-AI/
 
+## Train the model in your browser (no local terminal)
+
+Open the [CropSight tomato training notebook in Google Colab](https://colab.research.google.com/github/codex-inn/CropSight-AI/blob/main/notebooks/CropSight_Tomato_Training.ipynb). Download `CropSight_tomatOD_YOLO.zip` from the project conversation, open the notebook, run its cells in order, and upload the ZIP when prompted. In Colab, select **Runtime → Change runtime type → T4 GPU** if available.
+
+The notebook trains a YOLO model, evaluates it on the validation split, and downloads `cropsight-model-output.zip`. This is a training workflow, not an automatic deployment. The live GitHub Pages website still needs a deployed API endpoint to use the model. The included tomatOD dataset is CC BY-NC-SA 4.0; respect its non-commercial, attribution, and share-alike terms. Its ripeness labels are only a proxy for harvest readiness.
+
 ## Local development
 
 ```bash
